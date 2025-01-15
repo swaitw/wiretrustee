@@ -1,69 +1,119 @@
 package cmd
 
 import (
-	"github.com/spf13/cobra"
+	"context"
+	"os"
+	"path/filepath"
 	"runtime"
+
+	"github.com/spf13/cobra"
 )
 
-var (
-	installCmd = &cobra.Command{
-		Use:   "install",
-		Short: "installs wiretrustee service",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			SetFlagsFromEnvVars()
+var installCmd = &cobra.Command{
+	Use:   "install",
+	Short: "installs Netbird service",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		SetFlagsFromEnvVars(rootCmd)
 
-			svcConfig := newSVCConfig()
+		cmd.SetOut(cmd.OutOrStdout())
 
-			svcConfig.Arguments = []string{
-				"service",
-				"run",
-				"--config",
-				configPath,
-				"--log-level",
-				logLevel,
+		err := handleRebrand(cmd)
+		if err != nil {
+			return err
+		}
+
+		svcConfig := newSVCConfig()
+
+		svcConfig.Arguments = []string{
+			"service",
+			"run",
+			"--config",
+			configPath,
+			"--log-level",
+			logLevel,
+			"--daemon-addr",
+			daemonAddr,
+		}
+
+		if managementURL != "" {
+			svcConfig.Arguments = append(svcConfig.Arguments, "--management-url", managementURL)
+		}
+
+		if logFile != "console" {
+			svcConfig.Arguments = append(svcConfig.Arguments, "--log-file", logFile)
+		}
+
+		if runtime.GOOS == "linux" {
+			// Respected only by systemd systems
+			svcConfig.Dependencies = []string{"After=network.target syslog.target"}
+
+			if logFile != "console" {
+				setStdLogPath := true
+				dir := filepath.Dir(logFile)
+
+				_, err := os.Stat(dir)
+				if err != nil {
+					err = os.MkdirAll(dir, 0750)
+					if err != nil {
+						setStdLogPath = false
+					}
+				}
+
+				if setStdLogPath {
+					svcConfig.Option["LogOutput"] = true
+					svcConfig.Option["LogDirectory"] = dir
+				}
 			}
+		}
 
-			if runtime.GOOS == "linux" {
-				// Respected only by systemd systems
-				svcConfig.Dependencies = []string{"After=network.target syslog.target"}
-			}
+		if runtime.GOOS == "windows" {
+			svcConfig.Option["OnFailure"] = "restart"
+		}
 
-			s, err := newSVC(&program{}, svcConfig)
-			if err != nil {
-				cmd.PrintErrln(err)
-				return err
-			}
+		ctx, cancel := context.WithCancel(cmd.Context())
 
-			err = s.Install()
-			if err != nil {
-				cmd.PrintErrln(err)
-				return err
-			}
-			cmd.Println("Wiretrustee service has been installed")
-			return nil
-		},
-	}
-)
+		s, err := newSVC(newProgram(ctx, cancel), svcConfig)
+		if err != nil {
+			cmd.PrintErrln(err)
+			return err
+		}
 
-var (
-	uninstallCmd = &cobra.Command{
-		Use:   "uninstall",
-		Short: "uninstalls wiretrustee service from system",
-		Run: func(cmd *cobra.Command, args []string) {
-			SetFlagsFromEnvVars()
+		err = s.Install()
+		if err != nil {
+			cmd.PrintErrln(err)
+			return err
+		}
 
-			s, err := newSVC(&program{}, newSVCConfig())
-			if err != nil {
-				cmd.PrintErrln(err)
-				return
-			}
+		cmd.Println("Netbird service has been installed")
+		return nil
+	},
+}
 
-			err = s.Uninstall()
-			if err != nil {
-				cmd.PrintErrln(err)
-				return
-			}
-			cmd.Println("Wiretrustee has been uninstalled")
-		},
-	}
-)
+var uninstallCmd = &cobra.Command{
+	Use:   "uninstall",
+	Short: "uninstalls Netbird service from system",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		SetFlagsFromEnvVars(rootCmd)
+
+		cmd.SetOut(cmd.OutOrStdout())
+
+		err := handleRebrand(cmd)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithCancel(cmd.Context())
+
+		s, err := newSVC(newProgram(ctx, cancel), newSVCConfig())
+		if err != nil {
+			return err
+		}
+
+		err = s.Uninstall()
+		if err != nil {
+			return err
+		}
+		cmd.Println("Netbird service has been uninstalled")
+		return nil
+	},
+}

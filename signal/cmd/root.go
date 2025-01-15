@@ -2,10 +2,13 @@ package cmd
 
 import (
 	"fmt"
-	"github.com/spf13/cobra"
 	"os"
 	"os/signal"
 	"runtime"
+
+	"github.com/spf13/cobra"
+
+	"github.com/netbirdio/netbird/version"
 )
 
 const (
@@ -19,9 +22,10 @@ var (
 	logFile        string
 
 	rootCmd = &cobra.Command{
-		Use:   "wiretrustee-signal",
-		Short: "",
-		Long:  "",
+		Use:     "netbird-signal",
+		Short:   "",
+		Long:    "",
+		Version: version.NetbirdVersion(),
 	}
 
 	// Execution control channel for stopCh signal
@@ -32,16 +36,18 @@ var (
 func Execute() error {
 	return rootCmd.Execute()
 }
-func init() {
 
+func init() {
 	stopCh = make(chan int)
-	defaultLogFile = "/var/log/wiretrustee/signal.log"
+	defaultLogFile = "/var/log/netbird/signal.log"
+	defaultSignalSSLDir = "/var/lib/netbird/"
+
 	if runtime.GOOS == "windows" {
-		defaultLogFile = os.Getenv("PROGRAMDATA") + "\\Wiretrustee\\" + "signal.log"
+		defaultLogFile = os.Getenv("PROGRAMDATA") + "\\Netbird\\" + "signal.log"
 	}
 
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "")
-	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", defaultLogFile, "sets Wiretrustee log path. If console is specified the the log will be output to stdout")
+	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", defaultLogFile, "sets Netbird log path. If console is specified the log will be output to stdout")
 	rootCmd.AddCommand(runCmd)
 }
 
