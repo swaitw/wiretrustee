@@ -1,147 +1,234 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"github.com/google/uuid"
-	log "github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
-	"github.com/wiretrustee/wiretrustee/client/internal"
-	mgm "github.com/wiretrustee/wiretrustee/management/client"
-	mgmProto "github.com/wiretrustee/wiretrustee/management/proto"
-	"github.com/wiretrustee/wiretrustee/util"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"os"
+	"strings"
+	"time"
+
+	"github.com/skratchdot/open-golang/open"
+	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	gstatus "google.golang.org/grpc/status"
+
+	"github.com/netbirdio/netbird/client/internal"
+	"github.com/netbirdio/netbird/client/internal/auth"
+	"github.com/netbirdio/netbird/client/proto"
+	"github.com/netbirdio/netbird/client/system"
+	"github.com/netbirdio/netbird/util"
 )
 
-var (
-	loginCmd = &cobra.Command{
-		Use:   "login",
-		Short: "login to the Wiretrustee Management Service (first run)",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			SetFlagsFromEnvVars()
+var loginCmd = &cobra.Command{
+	Use:   "login",
+	Short: "login to the Netbird Management Service (first run)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		SetFlagsFromEnvVars(rootCmd)
 
-			err := util.InitLog(logLevel, logFile)
-			if err != nil {
-				log.Errorf("failed initializing log %v", err)
-				return err
-			}
+		cmd.SetOut(cmd.OutOrStdout())
 
-			config, err := internal.GetConfig(managementURL, configPath, preSharedKey)
-			if err != nil {
-				log.Errorf("failed getting config %s %v", configPath, err)
-				return err
-			}
-
-			//validate our peer's Wireguard PRIVATE key
-			myPrivateKey, err := wgtypes.ParseKey(config.PrivateKey)
-			if err != nil {
-				log.Errorf("failed parsing Wireguard key %s: [%s]", config.PrivateKey, err.Error())
-				return err
-			}
-
-			ctx := context.Background()
-
-			mgmTlsEnabled := false
-			if config.ManagementURL.Scheme == "https" {
-				mgmTlsEnabled = true
-			}
-
-			log.Debugf("connecting to Management Service %s", config.ManagementURL.String())
-			mgmClient, err := mgm.NewClient(ctx, config.ManagementURL.Host, myPrivateKey, mgmTlsEnabled)
-			if err != nil {
-				log.Errorf("failed connecting to Management Service %s %v", config.ManagementURL.String(), err)
-				return err
-			}
-			log.Debugf("connected to anagement Service %s", config.ManagementURL.String())
-
-			serverKey, err := mgmClient.GetServerPublicKey()
-			if err != nil {
-				log.Errorf("failed while getting Management Service public key: %v", err)
-				return err
-			}
-
-			_, err = loginPeer(*serverKey, mgmClient, setupKey)
-			if err != nil {
-				log.Errorf("failed logging-in peer on Management Service : %v", err)
-				return err
-			}
-
-			err = mgmClient.Close()
-			if err != nil {
-				log.Errorf("failed closing Management Service client: %v", err)
-				return err
-			}
-
-			return nil
-		},
-	}
-)
-
-// loginPeer attempts to login to Management Service. If peer wasn't registered, tries the registration flow.
-func loginPeer(serverPublicKey wgtypes.Key, client *mgm.Client, setupKey string) (*mgmProto.LoginResponse, error) {
-
-	loginResp, err := client.Login(serverPublicKey)
-	if err != nil {
-		if s, ok := status.FromError(err); ok && s.Code() == codes.PermissionDenied {
-			log.Debugf("peer registration required")
-			return registerPeer(serverPublicKey, client, setupKey)
-		} else {
-			return nil, err
-		}
-	}
-
-	log.Info("peer has successfully logged-in to Management Service")
-
-	return loginResp, nil
-}
-
-// registerPeer checks whether setupKey was provided via cmd line and if not then it prompts user to enter a key.
-// Otherwise tries to register with the provided setupKey via command line.
-func registerPeer(serverPublicKey wgtypes.Key, client *mgm.Client, setupKey string) (*mgmProto.LoginResponse, error) {
-
-	var err error
-	if setupKey == "" {
-		setupKey, err = promptPeerSetupKey()
+		err := util.InitLog(logLevel, "console")
 		if err != nil {
-			log.Errorf("failed getting setup key from user: %s", err)
-			return nil, err
+			return fmt.Errorf("failed initializing log %v", err)
 		}
-	}
 
-	validSetupKey, err := uuid.Parse(setupKey)
-	if err != nil {
-		return nil, err
-	}
+		ctx := internal.CtxInitState(context.Background())
 
-	log.Debugf("sending peer registration request to Management Service")
-	loginResp, err := client.Register(serverPublicKey, validSetupKey.String())
-	if err != nil {
-		log.Errorf("failed registering peer %v", err)
-		return nil, err
-	}
+		if hostName != "" {
+			// nolint
+			ctx = context.WithValue(ctx, system.DeviceNameCtxKey, hostName)
+		}
 
-	log.Infof("peer has been successfully registered on Management Service")
+		providedSetupKey, err := getSetupKey()
+		if err != nil {
+			return err
+		}
 
-	return loginResp, nil
+		// workaround to run without service
+		if logFile == "console" {
+			err = handleRebrand(cmd)
+			if err != nil {
+				return err
+			}
+
+			ic := internal.ConfigInput{
+				ManagementURL: managementURL,
+				AdminURL:      adminURL,
+				ConfigPath:    configPath,
+			}
+			if rootCmd.PersistentFlags().Changed(preSharedKeyFlag) {
+				ic.PreSharedKey = &preSharedKey
+			}
+
+			config, err := internal.UpdateOrCreateConfig(ic)
+			if err != nil {
+				return fmt.Errorf("get config file: %v", err)
+			}
+
+			config, _ = internal.UpdateOldManagementURL(ctx, config, configPath)
+
+			err = foregroundLogin(ctx, cmd, config, providedSetupKey)
+			if err != nil {
+				return fmt.Errorf("foreground login failed: %v", err)
+			}
+			cmd.Println("Logging successfully")
+			return nil
+		}
+
+		conn, err := DialClientGRPCServer(ctx, daemonAddr)
+		if err != nil {
+			return fmt.Errorf("failed to connect to daemon error: %v\n"+
+				"If the daemon is not running please run: "+
+				"\nnetbird service install \nnetbird service start\n", err)
+		}
+		defer conn.Close()
+
+		client := proto.NewDaemonServiceClient(conn)
+
+		var dnsLabelsReq []string
+		if dnsLabelsValidated != nil {
+			dnsLabelsReq = dnsLabelsValidated.ToSafeStringList()
+		}
+
+		loginRequest := proto.LoginRequest{
+			SetupKey:             providedSetupKey,
+			ManagementUrl:        managementURL,
+			IsLinuxDesktopClient: isLinuxRunningDesktop(),
+			Hostname:             hostName,
+			DnsLabels:            dnsLabelsReq,
+		}
+
+		if rootCmd.PersistentFlags().Changed(preSharedKeyFlag) {
+			loginRequest.OptionalPreSharedKey = &preSharedKey
+		}
+
+		var loginErr error
+
+		var loginResp *proto.LoginResponse
+
+		err = WithBackOff(func() error {
+			var backOffErr error
+			loginResp, backOffErr = client.Login(ctx, &loginRequest)
+			if s, ok := gstatus.FromError(backOffErr); ok && (s.Code() == codes.InvalidArgument ||
+				s.Code() == codes.PermissionDenied ||
+				s.Code() == codes.NotFound ||
+				s.Code() == codes.Unimplemented) {
+				loginErr = backOffErr
+				return nil
+			}
+			return backOffErr
+		})
+		if err != nil {
+			return fmt.Errorf("login backoff cycle failed: %v", err)
+		}
+
+		if loginErr != nil {
+			return fmt.Errorf("login failed: %v", loginErr)
+		}
+
+		if loginResp.NeedsSSOLogin {
+			openURL(cmd, loginResp.VerificationURIComplete, loginResp.UserCode)
+
+			_, err = client.WaitSSOLogin(ctx, &proto.WaitSSOLoginRequest{UserCode: loginResp.UserCode, Hostname: hostName})
+			if err != nil {
+				return fmt.Errorf("waiting sso login failed with: %v", err)
+			}
+		}
+
+		cmd.Println("Logging successfully")
+
+		return nil
+	},
 }
 
-// promptPeerSetupKey prompts user to enter Setup Key
-func promptPeerSetupKey() (string, error) {
-	fmt.Print("Enter setup key: ")
+func foregroundLogin(ctx context.Context, cmd *cobra.Command, config *internal.Config, setupKey string) error {
+	needsLogin := false
 
-	s := bufio.NewScanner(os.Stdin)
-	for s.Scan() {
-		input := s.Text()
-		if input != "" {
-			return input, nil
+	err := WithBackOff(func() error {
+		err := internal.Login(ctx, config, "", "")
+		if s, ok := gstatus.FromError(err); ok && (s.Code() == codes.InvalidArgument || s.Code() == codes.PermissionDenied) {
+			needsLogin = true
+			return nil
 		}
-		fmt.Println("Specified key is empty, try again:")
-
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("backoff cycle failed: %v", err)
 	}
 
-	return "", s.Err()
+	jwtToken := ""
+	if setupKey == "" && needsLogin {
+		tokenInfo, err := foregroundGetTokenInfo(ctx, cmd, config)
+		if err != nil {
+			return fmt.Errorf("interactive sso login failed: %v", err)
+		}
+		jwtToken = tokenInfo.GetTokenToUse()
+	}
+
+	var lastError error
+
+	err = WithBackOff(func() error {
+		err := internal.Login(ctx, config, setupKey, jwtToken)
+		if s, ok := gstatus.FromError(err); ok && (s.Code() == codes.InvalidArgument || s.Code() == codes.PermissionDenied) {
+			lastError = err
+			return nil
+		}
+		return err
+	})
+
+	if lastError != nil {
+		return fmt.Errorf("login failed: %v", lastError)
+	}
+
+	if err != nil {
+		return fmt.Errorf("backoff cycle failed: %v", err)
+	}
+
+	return nil
+}
+
+func foregroundGetTokenInfo(ctx context.Context, cmd *cobra.Command, config *internal.Config) (*auth.TokenInfo, error) {
+	oAuthFlow, err := auth.NewOAuthFlow(ctx, config, isLinuxRunningDesktop())
+	if err != nil {
+		return nil, err
+	}
+
+	flowInfo, err := oAuthFlow.RequestAuthInfo(context.TODO())
+	if err != nil {
+		return nil, fmt.Errorf("getting a request OAuth flow info failed: %v", err)
+	}
+
+	openURL(cmd, flowInfo.VerificationURIComplete, flowInfo.UserCode)
+
+	waitTimeout := time.Duration(flowInfo.ExpiresIn) * time.Second
+	waitCTX, c := context.WithTimeout(context.TODO(), waitTimeout)
+	defer c()
+
+	tokenInfo, err := oAuthFlow.WaitToken(waitCTX, flowInfo)
+	if err != nil {
+		return nil, fmt.Errorf("waiting for browser login failed: %v", err)
+	}
+
+	return &tokenInfo, nil
+}
+
+func openURL(cmd *cobra.Command, verificationURIComplete, userCode string) {
+	var codeMsg string
+	if userCode != "" && !strings.Contains(verificationURIComplete, userCode) {
+		codeMsg = fmt.Sprintf("and enter the code %s to authenticate.", userCode)
+	}
+
+	cmd.Println("Please do the SSO login in your browser. \n" +
+		"If your browser didn't open automatically, use this URL to log in:\n\n" +
+		verificationURIComplete + " " + codeMsg)
+	cmd.Println("")
+	if err := open.Run(verificationURIComplete); err != nil {
+		cmd.Println("\nAlternatively, you may want to use a setup key, see:\n\n" +
+			"https://docs.netbird.io/how-to/register-machines-using-setup-keys")
+	}
+}
+
+// isLinuxRunningDesktop checks if a Linux OS is running desktop environment
+func isLinuxRunningDesktop() bool {
+	return os.Getenv("DESKTOP_SESSION") != "" || os.Getenv("XDG_CURRENT_DESKTOP") != ""
 }

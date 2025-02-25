@@ -2,234 +2,480 @@ package cmd
 
 import (
 	"context"
-	"github.com/cenkalti/backoff/v4"
-	"github.com/kardianos/service"
+	"fmt"
+	"net"
+	"net/netip"
+	"runtime"
+	"strings"
+	"time"
+
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/wiretrustee/wiretrustee/client/internal"
-	mgm "github.com/wiretrustee/wiretrustee/management/client"
-	mgmProto "github.com/wiretrustee/wiretrustee/management/proto"
-	signal "github.com/wiretrustee/wiretrustee/signal/client"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"time"
+	gstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
+
+	"github.com/netbirdio/netbird/client/iface"
+	"github.com/netbirdio/netbird/client/internal"
+	"github.com/netbirdio/netbird/client/internal/peer"
+	"github.com/netbirdio/netbird/client/proto"
+	"github.com/netbirdio/netbird/client/system"
+	"github.com/netbirdio/netbird/management/domain"
+	"github.com/netbirdio/netbird/util"
+)
+
+const (
+	invalidInputType int = iota
+	ipInputType
+	interfaceInputType
+)
+
+const (
+	dnsLabelsFlag = "extra-dns-labels"
 )
 
 var (
+	foregroundMode     bool
+	dnsLabels          []string
+	dnsLabelsValidated domain.List
+
 	upCmd = &cobra.Command{
 		Use:   "up",
-		Short: "install, login and start wiretrustee client",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			SetFlagsFromEnvVars()
-			err := loginCmd.RunE(cmd, args)
-			if err != nil {
-				return err
-			}
-			if logFile == "console" {
-				return runClient()
-			}
-
-			s, err := newSVC(&program{}, newSVCConfig())
-			if err != nil {
-				cmd.PrintErrln(err)
-				return err
-			}
-
-			srvStatus, err := s.Status()
-			if err != nil {
-				if err == service.ErrNotInstalled {
-					log.Infof("%s. Installing it now", err.Error())
-					e := installCmd.RunE(cmd, args)
-					if e != nil {
-						return e
-					}
-				} else {
-					log.Warnf("failed retrieving service status: %v", err)
-				}
-			}
-			if srvStatus == service.StatusRunning {
-				stopCmd.Run(cmd, args)
-			}
-			return startCmd.RunE(cmd, args)
-		},
+		Short: "install, login and start Netbird client",
+		RunE:  upFunc,
 	}
 )
 
-// createEngineConfig converts configuration received from Management Service to EngineConfig
-func createEngineConfig(key wgtypes.Key, config *internal.Config, peerConfig *mgmProto.PeerConfig) (*internal.EngineConfig, error) {
-	iFaceBlackList := make(map[string]struct{})
-	for i := 0; i < len(config.IFaceBlackList); i += 2 {
-		iFaceBlackList[config.IFaceBlackList[i]] = struct{}{}
-	}
+func init() {
+	upCmd.PersistentFlags().BoolVarP(&foregroundMode, "foreground-mode", "F", false, "start service in foreground")
+	upCmd.PersistentFlags().StringVar(&interfaceName, interfaceNameFlag, iface.WgInterfaceDefault, "Wireguard interface name")
+	upCmd.PersistentFlags().Uint16Var(&wireguardPort, wireguardPortFlag, iface.DefaultWgPort, "Wireguard interface listening port")
+	upCmd.PersistentFlags().BoolVarP(&networkMonitor, networkMonitorFlag, "N", networkMonitor,
+		`Manage network monitoring. Defaults to true on Windows and macOS, false on Linux. `+
+			`E.g. --network-monitor=false to disable or --network-monitor=true to enable.`,
+	)
+	upCmd.PersistentFlags().StringSliceVar(&extraIFaceBlackList, extraIFaceBlackListFlag, nil, "Extra list of default interfaces to ignore for listening")
+	upCmd.PersistentFlags().DurationVar(&dnsRouteInterval, dnsRouteIntervalFlag, time.Minute, "DNS route update interval")
+	upCmd.PersistentFlags().BoolVar(&blockLANAccess, blockLANAccessFlag, false, "Block access to local networks (LAN) when using this peer as a router or exit node")
 
-	engineConf := &internal.EngineConfig{
-		WgIface:        config.WgIface,
-		WgAddr:         peerConfig.Address,
-		IFaceBlackList: iFaceBlackList,
-		WgPrivateKey:   key,
-	}
-
-	if config.PreSharedKey != "" {
-		preSharedKey, err := wgtypes.ParseKey(config.PreSharedKey)
-		if err != nil {
-			return nil, err
-		}
-		engineConf.PreSharedKey = &preSharedKey
-	}
-
-	return engineConf, nil
+	upCmd.PersistentFlags().StringSliceVar(&dnsLabels, dnsLabelsFlag, nil,
+		`Sets DNS labels`+
+			`You can specify a comma-separated list of up to 32 labels. `+
+			`An empty string "" clears the previous configuration. `+
+			`E.g. --extra-dns-labels vpc1 or --extra-dns-labels vpc1,mgmt1 `+
+			`or --extra-dns-labels ""`,
+	)
 }
 
-// connectToSignal creates Signal Service client and established a connection
-func connectToSignal(ctx context.Context, wtConfig *mgmProto.WiretrusteeConfig, ourPrivateKey wgtypes.Key) (*signal.Client, error) {
-	var sigTLSEnabled bool
-	if wtConfig.Signal.Protocol == mgmProto.HostConfig_HTTPS {
-		sigTLSEnabled = true
-	} else {
-		sigTLSEnabled = false
-	}
+func upFunc(cmd *cobra.Command, args []string) error {
+	SetFlagsFromEnvVars(rootCmd)
+	SetFlagsFromEnvVars(cmd)
 
-	signalClient, err := signal.NewClient(ctx, wtConfig.Signal.Uri, ourPrivateKey, sigTLSEnabled)
+	cmd.SetOut(cmd.OutOrStdout())
+
+	err := util.InitLog(logLevel, "console")
 	if err != nil {
-		log.Errorf("error while connecting to the Signal Exchange Service %s: %s", wtConfig.Signal.Uri, err)
-		return nil, status.Errorf(codes.FailedPrecondition, "failed connecting to Signal Service : %s", err)
+		return fmt.Errorf("failed initializing log %v", err)
 	}
 
-	return signalClient, nil
-}
-
-// connectToManagement creates Management Services client, establishes a connection, logs-in and gets a global Wiretrustee config (signal, turn, stun hosts, etc)
-func connectToManagement(ctx context.Context, managementAddr string, ourPrivateKey wgtypes.Key, tlsEnabled bool) (*mgm.Client, *mgmProto.LoginResponse, error) {
-	log.Debugf("connecting to management server %s", managementAddr)
-	client, err := mgm.NewClient(ctx, managementAddr, ourPrivateKey, tlsEnabled)
+	err = validateNATExternalIPs(natExternalIPs)
 	if err != nil {
-		return nil, nil, status.Errorf(codes.FailedPrecondition, "failed connecting to Management Service : %s", err)
-	}
-	log.Debugf("connected to management server %s", managementAddr)
-
-	serverPublicKey, err := client.GetServerPublicKey()
-	if err != nil {
-		return nil, nil, status.Errorf(codes.FailedPrecondition, "failed while getting Management Service public key: %s", err)
-	}
-
-	loginResp, err := client.Login(*serverPublicKey)
-	if err != nil {
-		if s, ok := status.FromError(err); ok && s.Code() == codes.PermissionDenied {
-			log.Error("peer registration required. Please run wiretrustee login command first")
-			return nil, nil, err
-		} else {
-			return nil, nil, err
-		}
-	}
-
-	log.Debugf("peer logged in to Management Service %s", managementAddr)
-
-	return client, loginResp, nil
-}
-
-func runClient() error {
-	var backOff = &backoff.ExponentialBackOff{
-		InitialInterval:     time.Second,
-		RandomizationFactor: backoff.DefaultRandomizationFactor,
-		Multiplier:          backoff.DefaultMultiplier,
-		MaxInterval:         10 * time.Second,
-		MaxElapsedTime:      24 * 3 * time.Hour, //stop the client after 3 days trying (must be a huge problem, e.g permission denied)
-		Stop:                backoff.Stop,
-		Clock:               backoff.SystemClock,
-	}
-
-	operation := func() error {
-
-		config, err := internal.ReadConfig(managementURL, configPath)
-		if err != nil {
-			log.Errorf("failed reading config %s %v", configPath, err)
-			return err
-		}
-
-		//validate our peer's Wireguard PRIVATE key
-		myPrivateKey, err := wgtypes.ParseKey(config.PrivateKey)
-		if err != nil {
-			log.Errorf("failed parsing Wireguard key %s: [%s]", config.PrivateKey, err.Error())
-			return err
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		mgmTlsEnabled := false
-		if config.ManagementURL.Scheme == "https" {
-			mgmTlsEnabled = true
-		}
-
-		// connect (just a connection, no stream yet) and login to Management Service to get an initial global Wiretrustee config
-		mgmClient, loginResp, err := connectToManagement(ctx, config.ManagementURL.Host, myPrivateKey, mgmTlsEnabled)
-		if err != nil {
-			log.Warn(err)
-			return err
-		}
-
-		// with the global Wiretrustee config in hand connect (just a connection, no stream yet) Signal
-		signalClient, err := connectToSignal(ctx, loginResp.GetWiretrusteeConfig(), myPrivateKey)
-		if err != nil {
-			log.Error(err)
-			return err
-		}
-
-		peerConfig := loginResp.GetPeerConfig()
-
-		engineConfig, err := createEngineConfig(myPrivateKey, config, peerConfig)
-		if err != nil {
-			log.Error(err)
-			return err
-		}
-
-		// create start the Wiretrustee Engine that will connect to the Signal and Management streams and manage connections to remote peers.
-		engine := internal.NewEngine(signalClient, mgmClient, engineConfig, cancel, ctx)
-		err = engine.Start()
-		if err != nil {
-			log.Errorf("error while starting Wiretrustee Connection Engine: %s", err)
-			return err
-		}
-
-		log.Print("Wiretrustee engine started, my IP is: ", peerConfig.Address)
-
-		select {
-		case <-stopCh:
-		case <-ctx.Done():
-		}
-
-		backOff.Reset()
-
-		err = mgmClient.Close()
-		if err != nil {
-			log.Errorf("failed closing Management Service client %v", err)
-			return err
-		}
-		err = signalClient.Close()
-		if err != nil {
-			log.Errorf("failed closing Signal Service client %v", err)
-			return err
-		}
-
-		err = engine.Stop()
-		if err != nil {
-			log.Errorf("failed stopping engine %v", err)
-			return err
-		}
-
-		go func() {
-			cleanupCh <- struct{}{}
-		}()
-
-		log.Info("stopped Wiretrustee client")
-
-		return ctx.Err()
-	}
-
-	err := backoff.Retry(operation, backOff)
-	if err != nil {
-		log.Errorf("exiting client retry loop due to unrecoverable error: %s", err)
 		return err
 	}
+
+	dnsLabelsValidated, err = validateDnsLabels(dnsLabels)
+	if err != nil {
+		return err
+	}
+
+	ctx := internal.CtxInitState(cmd.Context())
+
+	if hostName != "" {
+		// nolint
+		ctx = context.WithValue(ctx, system.DeviceNameCtxKey, hostName)
+	}
+
+	if foregroundMode {
+		return runInForegroundMode(ctx, cmd)
+	}
+	return runInDaemonMode(ctx, cmd)
+}
+
+func runInForegroundMode(ctx context.Context, cmd *cobra.Command) error {
+	err := handleRebrand(cmd)
+	if err != nil {
+		return err
+	}
+
+	customDNSAddressConverted, err := parseCustomDNSAddress(cmd.Flag(dnsResolverAddress).Changed)
+	if err != nil {
+		return err
+	}
+
+	ic := internal.ConfigInput{
+		ManagementURL:       managementURL,
+		AdminURL:            adminURL,
+		ConfigPath:          configPath,
+		NATExternalIPs:      natExternalIPs,
+		CustomDNSAddress:    customDNSAddressConverted,
+		ExtraIFaceBlackList: extraIFaceBlackList,
+		DNSLabels:           dnsLabelsValidated,
+	}
+
+	if cmd.Flag(enableRosenpassFlag).Changed {
+		ic.RosenpassEnabled = &rosenpassEnabled
+	}
+
+	if cmd.Flag(rosenpassPermissiveFlag).Changed {
+		ic.RosenpassPermissive = &rosenpassPermissive
+	}
+
+	if cmd.Flag(serverSSHAllowedFlag).Changed {
+		ic.ServerSSHAllowed = &serverSSHAllowed
+	}
+
+	if cmd.Flag(interfaceNameFlag).Changed {
+		if err := parseInterfaceName(interfaceName); err != nil {
+			return err
+		}
+		ic.InterfaceName = &interfaceName
+	}
+
+	if cmd.Flag(wireguardPortFlag).Changed {
+		p := int(wireguardPort)
+		ic.WireguardPort = &p
+	}
+
+	if cmd.Flag(networkMonitorFlag).Changed {
+		ic.NetworkMonitor = &networkMonitor
+	}
+
+	if rootCmd.PersistentFlags().Changed(preSharedKeyFlag) {
+		ic.PreSharedKey = &preSharedKey
+	}
+
+	if cmd.Flag(disableAutoConnectFlag).Changed {
+		ic.DisableAutoConnect = &autoConnectDisabled
+
+		if autoConnectDisabled {
+			cmd.Println("Autoconnect has been disabled. The client won't connect automatically when the service starts.")
+		}
+
+		if !autoConnectDisabled {
+			cmd.Println("Autoconnect has been enabled. The client will connect automatically when the service starts.")
+		}
+	}
+
+	if cmd.Flag(dnsRouteIntervalFlag).Changed {
+		ic.DNSRouteInterval = &dnsRouteInterval
+	}
+
+	if cmd.Flag(disableClientRoutesFlag).Changed {
+		ic.DisableClientRoutes = &disableClientRoutes
+	}
+	if cmd.Flag(disableServerRoutesFlag).Changed {
+		ic.DisableServerRoutes = &disableServerRoutes
+	}
+	if cmd.Flag(disableDNSFlag).Changed {
+		ic.DisableDNS = &disableDNS
+	}
+	if cmd.Flag(disableFirewallFlag).Changed {
+		ic.DisableFirewall = &disableFirewall
+	}
+
+	if cmd.Flag(blockLANAccessFlag).Changed {
+		ic.BlockLANAccess = &blockLANAccess
+	}
+
+	providedSetupKey, err := getSetupKey()
+	if err != nil {
+		return err
+	}
+
+	config, err := internal.UpdateOrCreateConfig(ic)
+	if err != nil {
+		return fmt.Errorf("get config file: %v", err)
+	}
+
+	config, _ = internal.UpdateOldManagementURL(ctx, config, configPath)
+
+	err = foregroundLogin(ctx, cmd, config, providedSetupKey)
+	if err != nil {
+		return fmt.Errorf("foreground login failed: %v", err)
+	}
+
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
+	SetupCloseHandler(ctx, cancel)
+
+	r := peer.NewRecorder(config.ManagementURL.String())
+	r.GetFullStatus()
+
+	connectClient := internal.NewConnectClient(ctx, config, r)
+	return connectClient.Run(nil)
+}
+
+func runInDaemonMode(ctx context.Context, cmd *cobra.Command) error {
+	customDNSAddressConverted, err := parseCustomDNSAddress(cmd.Flag(dnsResolverAddress).Changed)
+	if err != nil {
+		return err
+	}
+
+	conn, err := DialClientGRPCServer(ctx, daemonAddr)
+	if err != nil {
+		return fmt.Errorf("failed to connect to daemon error: %v\n"+
+			"If the daemon is not running please run: "+
+			"\nnetbird service install \nnetbird service start\n", err)
+	}
+	defer func() {
+		err := conn.Close()
+		if err != nil {
+			log.Warnf("failed closing daemon gRPC client connection %v", err)
+			return
+		}
+	}()
+
+	client := proto.NewDaemonServiceClient(conn)
+
+	status, err := client.Status(ctx, &proto.StatusRequest{})
+	if err != nil {
+		return fmt.Errorf("unable to get daemon status: %v", err)
+	}
+
+	if status.Status == string(internal.StatusConnected) {
+		cmd.Println("Already connected")
+		return nil
+	}
+
+	providedSetupKey, err := getSetupKey()
+	if err != nil {
+		return err
+	}
+
+	loginRequest := proto.LoginRequest{
+		SetupKey:             providedSetupKey,
+		ManagementUrl:        managementURL,
+		AdminURL:             adminURL,
+		NatExternalIPs:       natExternalIPs,
+		CleanNATExternalIPs:  natExternalIPs != nil && len(natExternalIPs) == 0,
+		CustomDNSAddress:     customDNSAddressConverted,
+		IsLinuxDesktopClient: isLinuxRunningDesktop(),
+		Hostname:             hostName,
+		ExtraIFaceBlacklist:  extraIFaceBlackList,
+		DnsLabels:            dnsLabels,
+		CleanDNSLabels:       dnsLabels != nil && len(dnsLabels) == 0,
+	}
+
+	if rootCmd.PersistentFlags().Changed(preSharedKeyFlag) {
+		loginRequest.OptionalPreSharedKey = &preSharedKey
+	}
+
+	if cmd.Flag(enableRosenpassFlag).Changed {
+		loginRequest.RosenpassEnabled = &rosenpassEnabled
+	}
+
+	if cmd.Flag(rosenpassPermissiveFlag).Changed {
+		loginRequest.RosenpassPermissive = &rosenpassPermissive
+	}
+
+	if cmd.Flag(serverSSHAllowedFlag).Changed {
+		loginRequest.ServerSSHAllowed = &serverSSHAllowed
+	}
+
+	if cmd.Flag(disableAutoConnectFlag).Changed {
+		loginRequest.DisableAutoConnect = &autoConnectDisabled
+	}
+
+	if cmd.Flag(interfaceNameFlag).Changed {
+		if err := parseInterfaceName(interfaceName); err != nil {
+			return err
+		}
+		loginRequest.InterfaceName = &interfaceName
+	}
+
+	if cmd.Flag(wireguardPortFlag).Changed {
+		wp := int64(wireguardPort)
+		loginRequest.WireguardPort = &wp
+	}
+
+	if cmd.Flag(networkMonitorFlag).Changed {
+		loginRequest.NetworkMonitor = &networkMonitor
+	}
+
+	if cmd.Flag(dnsRouteIntervalFlag).Changed {
+		loginRequest.DnsRouteInterval = durationpb.New(dnsRouteInterval)
+	}
+
+	if cmd.Flag(disableClientRoutesFlag).Changed {
+		loginRequest.DisableClientRoutes = &disableClientRoutes
+	}
+	if cmd.Flag(disableServerRoutesFlag).Changed {
+		loginRequest.DisableServerRoutes = &disableServerRoutes
+	}
+	if cmd.Flag(disableDNSFlag).Changed {
+		loginRequest.DisableDns = &disableDNS
+	}
+	if cmd.Flag(disableFirewallFlag).Changed {
+		loginRequest.DisableFirewall = &disableFirewall
+	}
+
+	if cmd.Flag(blockLANAccessFlag).Changed {
+		loginRequest.BlockLanAccess = &blockLANAccess
+	}
+
+	var loginErr error
+
+	var loginResp *proto.LoginResponse
+
+	err = WithBackOff(func() error {
+		var backOffErr error
+		loginResp, backOffErr = client.Login(ctx, &loginRequest)
+		if s, ok := gstatus.FromError(backOffErr); ok && (s.Code() == codes.InvalidArgument ||
+			s.Code() == codes.PermissionDenied ||
+			s.Code() == codes.NotFound ||
+			s.Code() == codes.Unimplemented) {
+			loginErr = backOffErr
+			return nil
+		}
+		return backOffErr
+	})
+	if err != nil {
+		return fmt.Errorf("login backoff cycle failed: %v", err)
+	}
+
+	if loginErr != nil {
+		return fmt.Errorf("login failed: %v", loginErr)
+	}
+
+	if loginResp.NeedsSSOLogin {
+
+		openURL(cmd, loginResp.VerificationURIComplete, loginResp.UserCode)
+
+		_, err = client.WaitSSOLogin(ctx, &proto.WaitSSOLoginRequest{UserCode: loginResp.UserCode, Hostname: hostName})
+		if err != nil {
+			return fmt.Errorf("waiting sso login failed with: %v", err)
+		}
+	}
+
+	if _, err := client.Up(ctx, &proto.UpRequest{}); err != nil {
+		return fmt.Errorf("call service up method: %v", err)
+	}
+	cmd.Println("Connected")
 	return nil
+}
+
+func validateNATExternalIPs(list []string) error {
+	for _, element := range list {
+		if element == "" {
+			return fmt.Errorf("empty string is not a valid input for %s", externalIPMapFlag)
+		}
+
+		subElements := strings.Split(element, "/")
+		if len(subElements) > 2 {
+			return fmt.Errorf("%s is not a valid input for %s. it should be formatted as \"String\" or \"String/String\"", element, externalIPMapFlag)
+		}
+
+		if len(subElements) == 1 && !isValidIP(subElements[0]) {
+			return fmt.Errorf("%s is not a valid input for %s. it should be formatted as \"IP\" or \"IP/IP\", or \"IP/Interface Name\"", element, externalIPMapFlag)
+		}
+
+		last := 0
+		for _, singleElement := range subElements {
+			inputType, err := validateElement(singleElement)
+			if err != nil {
+				return fmt.Errorf("%s is not a valid input for %s. it should be an IP string or a network name", singleElement, externalIPMapFlag)
+			}
+			if last == interfaceInputType && inputType == interfaceInputType {
+				return fmt.Errorf("%s is not a valid input for %s. it should not contain two interface names", element, externalIPMapFlag)
+			}
+			last = inputType
+		}
+	}
+	return nil
+}
+
+func parseInterfaceName(name string) error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+
+	if strings.HasPrefix(name, "utun") {
+		return nil
+	}
+
+	return fmt.Errorf("invalid interface name %s. Please use the prefix utun followed by a number on MacOS. e.g., utun1 or utun199", name)
+}
+
+func validateElement(element string) (int, error) {
+	if isValidIP(element) {
+		return ipInputType, nil
+	}
+	validIface, err := isValidInterface(element)
+	if err != nil {
+		return invalidInputType, fmt.Errorf("unable to validate the network interface name, error: %s", err)
+	}
+
+	if validIface {
+		return interfaceInputType, nil
+	}
+
+	return interfaceInputType, fmt.Errorf("invalid IP or network interface name not found")
+}
+
+func isValidIP(ip string) bool {
+	return net.ParseIP(ip) != nil
+}
+
+func isValidInterface(name string) (bool, error) {
+	netInterfaces, err := net.Interfaces()
+	if err != nil {
+		return false, err
+	}
+	for _, iface := range netInterfaces {
+		if iface.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func parseCustomDNSAddress(modified bool) ([]byte, error) {
+	var parsed []byte
+	if modified {
+		if !isValidAddrPort(customDNSAddress) {
+			return nil, fmt.Errorf("%s is invalid, it should be formatted as IP:Port string or as an empty string like \"\"", customDNSAddress)
+		}
+		if customDNSAddress == "" && logFile != "console" {
+			parsed = []byte("empty")
+		} else {
+			parsed = []byte(customDNSAddress)
+		}
+	}
+	return parsed, nil
+}
+
+func validateDnsLabels(labels []string) (domain.List, error) {
+	var (
+		domains domain.List
+		err     error
+	)
+
+	if len(labels) == 0 {
+		return domains, nil
+	}
+
+	domains, err = domain.ValidateDomains(labels)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate dns labels: %v", err)
+	}
+
+	return domains, nil
+}
+
+func isValidAddrPort(input string) bool {
+	if input == "" {
+		return true
+	}
+	_, err := netip.ParseAddrPort(input)
+	return err == nil
 }

@@ -2,21 +2,25 @@ package client
 
 import (
 	"context"
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-	log "github.com/sirupsen/logrus"
-	sigProto "github.com/wiretrustee/wiretrustee/signal/proto"
-	"github.com/wiretrustee/wiretrustee/signal/server"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/keepalive"
-	"google.golang.org/grpc/metadata"
 	"net"
 	"sync"
 	"time"
+
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
+	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
+
+	sigProto "github.com/netbirdio/netbird/signal/proto"
+	"github.com/netbirdio/netbird/signal/server"
 )
 
-var _ = Describe("Client", func() {
+var _ = Describe("GrpcClient", func() {
 
 	var (
 		addr     string
@@ -42,15 +46,18 @@ var _ = Describe("Client", func() {
 				var msgReceived sync.WaitGroup
 				msgReceived.Add(2)
 
-				var receivedOnA string
-				var receivedOnB string
+				var payloadReceivedOnA string
+				var payloadReceivedOnB string
+				var featuresSupportedReceivedOnA []uint32
+				var featuresSupportedReceivedOnB []uint32
 
 				// connect PeerA to Signal
 				keyA, _ := wgtypes.GenerateKey()
 				clientA := createSignalClient(addr, keyA)
 				go func() {
-					err := clientA.Receive(func(msg *sigProto.Message) error {
-						receivedOnA = msg.GetBody().GetPayload()
+					err := clientA.Receive(context.Background(), func(msg *sigProto.Message) error {
+						payloadReceivedOnA = msg.GetBody().GetPayload()
+						featuresSupportedReceivedOnA = msg.GetBody().GetFeaturesSupported()
 						msgReceived.Done()
 						return nil
 					})
@@ -65,8 +72,9 @@ var _ = Describe("Client", func() {
 				clientB := createSignalClient(addr, keyB)
 
 				go func() {
-					err := clientB.Receive(func(msg *sigProto.Message) error {
-						receivedOnB = msg.GetBody().GetPayload()
+					err := clientB.Receive(context.Background(), func(msg *sigProto.Message) error {
+						payloadReceivedOnB = msg.GetBody().GetPayload()
+						featuresSupportedReceivedOnB = msg.GetBody().GetFeaturesSupported()
 						err := clientB.Send(&sigProto.Message{
 							Key:       keyB.PublicKey().String(),
 							RemoteKey: keyA.PublicKey().String(),
@@ -89,7 +97,7 @@ var _ = Describe("Client", func() {
 				err := clientA.Send(&sigProto.Message{
 					Key:       keyA.PublicKey().String(),
 					RemoteKey: keyB.PublicKey().String(),
-					Body:      &sigProto.Body{Payload: "ping"},
+					Body:      &sigProto.Body{Payload: "ping", FeaturesSupported: []uint32{DirectCheck}},
 				})
 				if err != nil {
 					Fail("failed sending a message to PeerB")
@@ -99,9 +107,10 @@ var _ = Describe("Client", func() {
 					Fail("test timed out on waiting for peers to exchange messages")
 				}
 
-				Expect(receivedOnA).To(BeEquivalentTo("pong"))
-				Expect(receivedOnB).To(BeEquivalentTo("ping"))
-
+				Expect(payloadReceivedOnA).To(BeEquivalentTo("pong"))
+				Expect(payloadReceivedOnB).To(BeEquivalentTo("ping"))
+				Expect(featuresSupportedReceivedOnA).To(BeNil())
+				Expect(featuresSupportedReceivedOnB).To(ContainElements([]uint32{DirectCheck}))
 			})
 		})
 	})
@@ -113,7 +122,7 @@ var _ = Describe("Client", func() {
 				key, _ := wgtypes.GenerateKey()
 				client := createSignalClient(addr, key)
 				go func() {
-					err := client.Receive(func(msg *sigProto.Message) error {
+					err := client.Receive(context.Background(), func(msg *sigProto.Message) error {
 						return nil
 					})
 					if err != nil {
@@ -159,7 +168,7 @@ var _ = Describe("Client", func() {
 
 })
 
-func createSignalClient(addr string, key wgtypes.Key) *Client {
+func createSignalClient(addr string, key wgtypes.Key) *GrpcClient {
 	var sigTLSEnabled = false
 	client, err := NewClient(context.Background(), addr, key, sigTLSEnabled)
 	if err != nil {
@@ -170,7 +179,8 @@ func createSignalClient(addr string, key wgtypes.Key) *Client {
 
 func createRawSignalClient(addr string) sigProto.SignalExchangeClient {
 	ctx := context.Background()
-	conn, err := grpc.DialContext(ctx, addr, grpc.WithInsecure(),
+	conn, err := grpc.DialContext(ctx, addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    3 * time.Second,
@@ -189,7 +199,11 @@ func startSignal() (*grpc.Server, net.Listener) {
 		panic(err)
 	}
 	s := grpc.NewServer()
-	sigProto.RegisterSignalExchangeServer(s, server.NewServer())
+	srv, err := server.NewServer(context.Background(), otel.Meter(""))
+	if err != nil {
+		panic(err)
+	}
+	sigProto.RegisterSignalExchangeServer(s, srv)
 	go func() {
 		if err := s.Serve(lis); err != nil {
 			log.Fatalf("failed to serve: %v", err)
